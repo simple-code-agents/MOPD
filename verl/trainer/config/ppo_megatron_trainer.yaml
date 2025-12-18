@@ -131,6 +131,24 @@ algorithm:
     reweight_method: pow # ["pow", "max_min", "max_random"]
     weight_pow: 2.0
 
+  # On-policy distillation settings
+  on_policy_distill:
+
+    # Whether to enable on-policy distillation
+    enable: False
+
+    # Whether to normalize per-token advantages when distilling
+    normalize_advantage: True
+
+    # Global scale applied to teacher-student logprob gap
+    reward_scale: 1.0
+
+    # Whether to mask prompt tokens when computing distillation rewards
+    mask_prompt: True
+
+    # Prefer rollout log probabilities instead of recomputed ones when available
+    prefer_rollout_log_probs: False
+
 trainer:
   balance_batch: True
   total_epochs: 30
