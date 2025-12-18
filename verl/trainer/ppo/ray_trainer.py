@@ -330,6 +330,12 @@ class RayPPOTrainer:
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
         # legacy reward model implementation
         self.use_rm = need_reward_model(self.role_worker_mapping)
+        self.on_policy_distill_cfg = self.config.algorithm.get("on_policy_distill", None)
+        self.use_on_policy_distill = bool(self.on_policy_distill_cfg and self.on_policy_distill_cfg.enable)
+        if self.use_on_policy_distill and not self.use_reference_policy:
+            raise ValueError("On-policy distillation requires a reference (teacher) policy. Please enable ref model.")
+        if self.use_on_policy_distill and self.use_rm:
+            print("[Warn] on-policy distillation enabled: reward model outputs will be ignored.")
         self.use_reward_loop = self.config.reward_model.use_reward_loop
 
         self.use_critic = need_critic(self.config)
@@ -1090,6 +1096,88 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
+    def _compute_on_policy_distill_reward(
+        self, batch: DataProto, timing_raw: dict
+    ) -> tuple[torch.Tensor, dict[str, list], dict[str, float]]:
+        """Compute dense rewards from teacher vs student logprobs.
+
+        Rewards are -(logp_student - logp_teacher) per token.
+        """
+
+        if "response_mask" not in batch.batch.keys():
+            batch.batch["response_mask"] = compute_response_mask(batch)
+
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+
+        opd_get = self.on_policy_distill_cfg.get if hasattr(self.on_policy_distill_cfg, "get") else None
+        def _opd_get(key: str, default):
+            return opd_get(key, default) if opd_get is not None else getattr(self.on_policy_distill_cfg, key, default)
+
+        # Ensure student log probs are available.
+        if "old_log_probs" not in batch.batch and not bypass_recomputing_logprobs:
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                entropys = old_log_prob.batch["entropys"]
+                response_masks = batch.batch["response_mask"]
+                actor_config = self.config.actor_rollout_ref.actor
+                entropy_agg = agg_loss(
+                    loss_mat=entropys,
+                    loss_mask=response_masks,
+                    loss_agg_mode=actor_config.loss_agg_mode,
+                    loss_scale_factor=actor_config.loss_scale_factor,
+                )
+                metrics = {
+                    "actor/entropy": entropy_agg.detach().item(),
+                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                }
+                old_log_prob.batch.pop("entropys")
+                batch = batch.union(old_log_prob)
+            # return metrics so caller can merge
+            distill_metrics = metrics
+        else:
+            distill_metrics = {}
+
+        prefer_rollout = bool(_opd_get("prefer_rollout_log_probs", False))
+        student_log_probs = None
+        if prefer_rollout:
+            student_log_probs = batch.batch.get("rollout_log_probs")
+        if student_log_probs is None:
+            student_log_probs = batch.batch.get("old_log_probs")
+        if student_log_probs is None and not prefer_rollout:
+            student_log_probs = batch.batch.get("rollout_log_probs")
+        if student_log_probs is None:
+            raise ValueError("On-policy distillation requires student log probs (old_log_probs or rollout_log_probs).")
+
+        if self.use_reference_policy and "ref_log_prob" not in batch.batch:
+            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                ref_log_prob = self._compute_ref_log_prob(batch)
+                batch = batch.union(ref_log_prob)
+
+        teacher_log_probs = batch.batch["ref_log_prob"]
+        response_mask = batch.batch["response_mask"]
+
+        with torch.no_grad():
+            reverse_kl = student_log_probs - teacher_log_probs
+            reward_scale = float(_opd_get("reward_scale", 1.0) or 1.0)
+            rewards = -reverse_kl * reward_scale
+            if _opd_get("mask_prompt", True):
+                rewards = rewards * response_mask
+
+        distill_metrics.update(
+            {
+                "distill/reverse_kl": masked_mean(reverse_kl, mask=response_mask, axis=-1).mean().item(),
+                "distill/teacher_logprob": masked_mean(
+                    teacher_log_probs, mask=response_mask, axis=-1
+                ).mean().item(),
+                "distill/student_logprob": masked_mean(
+                    student_log_probs, mask=response_mask, axis=-1
+                ).mean().item(),
+            }
+        )
+
+        return rewards, {}, distill_metrics
+
     def _compute_old_log_prob(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
@@ -1325,22 +1413,31 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            if not self.use_reward_loop:
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            else:
-                                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                    reward_extra_infos_dict: dict[str, list] = {}
+                    reward_tensor = None
 
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        if self.use_on_policy_distill:
+                            reward_tensor, reward_extra_infos_dict, distill_metrics = (
+                                self._compute_on_policy_distill_reward(batch, timing_raw)
                             )
+                            metrics.update(distill_metrics)
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if not self.use_reward_loop:
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                else:
+                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1348,42 +1445,43 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+                    if "old_log_probs" not in batch.batch:
+                        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                            from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
-                        apply_bypass_mode(
-                            batch=batch,
-                            rollout_corr_config=rollout_corr_config,
-                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                        )
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
+                            apply_bypass_mode(
+                                batch=batch,
+                                rollout_corr_config=rollout_corr_config,
+                                policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                             )
-                            old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
-                            }
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
+                        else:  # Recompute old_log_probs
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
+                                )
+                                old_log_prob_metrics = {
+                                    "actor/entropy": entropy_agg.detach().item(),
+                                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                                }
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                                batch = batch.union(old_log_prob)
+                                if "rollout_log_probs" in batch.batch.keys():
+                                    # TODO: we may want to add diff of probs too.
+                                    from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                metrics.update(calculate_debug_metrics(batch))
+                                    metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.use_reference_policy:
+                    if self.use_reference_policy and "ref_log_prob" not in batch.batch:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
@@ -1397,8 +1495,7 @@ class RayPPOTrainer:
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async and not self.use_on_policy_distill:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 

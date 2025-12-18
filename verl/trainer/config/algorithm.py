@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "OnPolicyDistillConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -54,6 +60,27 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class OnPolicyDistillConfig(BaseConfig):
+    """Configuration for on-policy distillation.
+
+    Args:
+        enable (bool): Whether to turn on on-policy distillation.
+        normalize_advantage (bool): Whether to normalize per-token advantages.
+        reward_scale (float): Global scale on the teacher-student logprob gap.
+        mask_prompt (bool): If True, zero out the prompt portion before computing rewards.
+        prefer_rollout_log_probs (bool): If True, use rollout_log_probs when available; otherwise
+            fall back to recomputed old_log_probs. Useful for bypass mode where old_log_probs are
+            intentionally skipped.
+    """
+
+    enable: bool = False
+    normalize_advantage: bool = True
+    reward_scale: float = 1.0
+    mask_prompt: bool = True
+    prefer_rollout_log_probs: bool = False
 
 
 @dataclass
@@ -496,3 +523,5 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # On-policy distillation: dense teacher guidance on student rollouts
+    on_policy_distill: OnPolicyDistillConfig = field(default_factory=OnPolicyDistillConfig)

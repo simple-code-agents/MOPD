@@ -417,6 +417,41 @@ def compute_grpo_passk_outcome_advantage(
     return advantages, advantages
 
 
+@register_adv_est("on_policy_distill")
+def compute_on_policy_distill_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """On-policy distillation advantage estimator.
+
+    Treats per-token rewards (teacher logprob - student logprob) as advantages, optionally
+    normalizing them for stability.
+    """
+
+    with torch.no_grad():
+        advantages = token_level_rewards * response_mask
+
+        normalize = True
+        opd_cfg = None
+        if config is not None:
+            # AlgoConfig behaves like DictConfig/BaseConfig
+            opd_cfg = config.get("on_policy_distill", None) if hasattr(config, "get") else None
+            if opd_cfg is None:
+                opd_cfg = getattr(config, "on_policy_distill", None)
+        if opd_cfg is not None:
+            normalize = opd_cfg.get("normalize_advantage", True)
+
+        if normalize:
+            valid_adv = advantages[response_mask.bool()]
+            if valid_adv.numel() > 0:
+                advantages = advantages - valid_adv.mean()
+                advantages = advantages / (valid_adv.std() + 1e-8)
+
+    return advantages, advantages
+
+
 @register_adv_est(
     AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE
 )  # or simply: @register_adv_est("reinforce_plus_plus_baseline")
