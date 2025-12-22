@@ -78,6 +78,17 @@ verl is fast with:
 
 - **FSDP**, **FSDP2** and **Megatron-LM** for training.
 - **vLLM**, **SGLang** and **HF Transformers** for rollout generation.
+
+### On-Policy Distillation (MOPD)
+
+The new `mopd` advantage estimator lets you run dense, on-policy distillation updates without leaving the PPO pipeline. To enable it:
+
+- Set `algorithm.adv_estimator: mopd` so PPO pulls advantages from reverse-KL signals instead of rewards.
+- Add a teacher worker by toggling `teacher.enable: true`. The `teacher.config` block reuses the same schema as `actor_rollout_ref`, so you can simply override the model path, tokenizer, or log-prob micro batch sizes for the teacher.
+- Point the teacher at a stronger checkpoint via `teacher.config.model.path` (defaults to the actor config if left unchanged).
+- Keep rollout/reward computation unchanged—`RayPPOTrainer` now asks the teacher for log-probs on every sampled token and feeds `log p_T - log p_S` straight into the PPO loss.
+
+Because the teacher runs as an independent worker group, you can place it on separate GPUs, profile it independently, or disable it when switching back to reward-driven training.
 - Compatible with Hugging Face Transformers and Modelscope Hub: [Qwen-3](https://github.com/volcengine/verl/blob/main/examples/grpo_trainer/run_qwen3-8b.sh), Qwen-2.5, Llama3.1, Gemma2, DeepSeek-LLM, etc
 - Supervised fine-tuning.
 - Reinforcement learning with [PPO](examples/ppo_trainer/), [GRPO](examples/grpo_trainer/), [GSPO](recipe/gspo/), [ReMax](examples/remax_trainer/), [REINFORCE++](https://verl.readthedocs.io/en/latest/examples/config.html#algorithm), [RLOO](examples/rloo_trainer/), [PRIME](recipe/prime/), [DAPO](recipe/dapo/), [DrGRPO](recipe/drgrpo), [KL_Cov & Clip_Cov](recipe/entropy) etc.

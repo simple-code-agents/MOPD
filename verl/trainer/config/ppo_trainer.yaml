@@ -55,6 +55,15 @@ actor_rollout_ref:
     # for huge model, layered summon can save memory (prevent OOM) but make it slower
     layered_summon: False
 
+# Optional teacher policy used for on-policy distillation. Disabled by default.
+teacher:
+
+  # Toggle to enable the teacher worker group
+  enable: False
+
+  # Teacher worker config. Use actor_rollout_ref as a template so overriding fields stay consistent.
+  config: ${actor_rollout_ref}
+
 # custom reward function definition
 custom_reward_function:
 

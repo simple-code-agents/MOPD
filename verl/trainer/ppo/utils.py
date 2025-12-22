@@ -34,6 +34,7 @@ class Role(Enum):
     Critic = 3
     RefPolicy = 4
     RewardModel = 5
+        Teacher = 7
     ActorRolloutRef = 6
     Env = 7
 
@@ -47,6 +48,7 @@ class Role(Enum):
             Role.ActorRollout: "actor_rollout",
             Role.Critic: "critic",
             Role.RefPolicy: "ref",
+                Role.Teacher: "teacher",
             Role.RewardModel: "rm",
             Role.ActorRolloutRef: "actor_rollout_ref",
         }
@@ -60,6 +62,7 @@ class Role(Enum):
             "actor_rollout": cls.ActorRollout,
             "critic": cls.Critic,
             "ref": cls.RefPolicy,
+                "teacher": cls.Teacher,
             "rm": cls.RewardModel,
             "actor_rollout_ref": cls.ActorRolloutRef,
         }
@@ -72,6 +75,12 @@ class Role(Enum):
 def need_reference_policy(
     role_worker_mapping: dict[Role, WorkerType],
 ) -> bool:
+
+    def need_teacher_policy(
+        role_worker_mapping: dict[Role, WorkerType],
+    ) -> bool:
+        """Given a role worker mapping, do we need teacher policy."""
+        return Role.Teacher in role_worker_mapping
     """Given a role worker mapping, do we need ref policy."""
     return Role.RefPolicy in role_worker_mapping or Role.ActorRolloutRef in role_worker_mapping
 

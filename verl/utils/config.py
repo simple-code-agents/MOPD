@@ -17,6 +17,8 @@ from typing import Any, Optional
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from verl.trainer.ppo.core_algos import AdvantageEstimator
+
 __all__ = ["omega_conf_to_dataclass", "validate_config"]
 
 
@@ -75,6 +77,7 @@ def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
     use_critic: bool,
+    use_teacher_policy: bool = False,
 ) -> None:
     """Validate an OmegaConf DictConfig.
 
@@ -111,6 +114,18 @@ def validate_config(
             f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
             f"({minimal_bsz})"
         )
+
+    teacher_cfg = getattr(config, "teacher", None)
+    algo_adv = config.algorithm.adv_estimator
+    if not isinstance(algo_adv, AdvantageEstimator):
+        try:
+            algo_adv = AdvantageEstimator(algo_adv)
+        except ValueError:
+            raise ValueError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}") from None
+    teacher_required = algo_adv == AdvantageEstimator.MOPD
+
+    if teacher_required and not use_teacher_policy:
+        raise ValueError("algorithm.adv_estimator='mopd' requires enabling the teacher worker")
 
     # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
     # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
@@ -165,6 +180,20 @@ def validate_config(
             config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
             config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
             "actor_rollout_ref.rollout",
+        )
+
+    if use_teacher_policy:
+        if teacher_cfg is None or not teacher_cfg.enable:
+            raise ValueError("Teacher worker is enabled but config.teacher.enable is False")
+        teacher_config = getattr(teacher_cfg, "config", None)
+        if teacher_config is None:
+            raise ValueError("Teacher worker requires teacher.config to be populated")
+        if not teacher_config.ref:
+            raise ValueError("teacher.config.ref must be provided for teacher log-prob computation")
+        check_mutually_exclusive(
+            teacher_config.ref.log_prob_micro_batch_size,
+            teacher_config.ref.log_prob_micro_batch_size_per_gpu,
+            "teacher.ref",
         )
 
     # Check for reward model micro-batch size conflicts

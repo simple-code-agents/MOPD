@@ -50,7 +50,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    need_teacher_policy,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -256,6 +263,9 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        for key in ("old_log_probs", "teacher_log_prob", "rollout_log_probs"):
+            if key in data.batch:
+                adv_kwargs[key] = data.batch[key]
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
@@ -328,6 +338,14 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
+        teacher_cfg = getattr(self.config, "teacher", None)
+        self.teacher_config = None
+        if teacher_cfg is not None and teacher_cfg.enable:
+            self.teacher_config = OmegaConf.create(OmegaConf.to_container(teacher_cfg.config, resolve=True))
+        self.use_teacher_policy = need_teacher_policy(self.role_worker_mapping)
+        if self.use_teacher_policy and self.teacher_config is None:
+            raise ValueError("Teacher worker is enabled but config.teacher.config is missing or disabled")
+        self.use_teacher_policy = self.use_teacher_policy and self.teacher_config is not None
         # legacy reward model implementation
         self.use_rm = need_reward_model(self.role_worker_mapping)
         self.use_reward_loop = self.config.reward_model.use_reward_loop
@@ -345,6 +363,10 @@ class RayPPOTrainer:
             config.actor_rollout_ref.model.get("lora_rank", 0) > 0
             or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         )
+        self.teacher_wg = None
+        self.teacher_advantage_enabled = self.config.algorithm.adv_estimator == AdvantageEstimator.MOPD
+        if self.teacher_advantage_enabled and not self.use_teacher_policy:
+            raise ValueError("algorithm.adv_estimator='mopd' requires enabling the teacher worker")
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -744,6 +766,15 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
+        if self.use_teacher_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Teacher)
+            teacher_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.Teacher],
+                config=self.teacher_config,
+                role=str(Role.RefPolicy),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.Teacher)] = teacher_cls
+
         # create a reward model if reward_fn is None
         # for legacy discriminative reward model, we create a reward model worker here
         # for reward loop discriminative reward model, we create a reward loop manager here
@@ -831,6 +862,10 @@ class RayPPOTrainer:
                 # Model engine: ActorRolloutRefWorker
                 assert str(Role.ActorRolloutRef) in all_wg, f"{all_wg.keys()=}"
                 self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
+
+        if self.use_teacher_policy:
+            self.teacher_wg = all_wg[str(Role.Teacher)]
+            self.teacher_wg.init_model()
 
         self.rm_wg = None
         # initalization of rm_wg will be deprecated in the future
@@ -999,6 +1034,8 @@ class RayPPOTrainer:
             self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
             if self.use_reference_policy:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+            if self.use_teacher_policy:
+                self.teacher_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
             if self.use_rm and not self.use_reward_loop:
@@ -1010,6 +1047,8 @@ class RayPPOTrainer:
             self.actor_rollout_wg.stop_profile()
             if self.use_reference_policy:
                 self.ref_policy_wg.stop_profile()
+            if self.use_teacher_policy:
+                self.teacher_wg.stop_profile()
             if self.use_critic:
                 self.critic_wg.stop_profile()
             if self.use_rm and not self.use_reward_loop:
@@ -1089,6 +1128,21 @@ class RayPPOTrainer:
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
         return ref_log_prob
+
+    def _compute_teacher_log_prob(self, batch: DataProto) -> DataProto:
+        if self.use_legacy_worker_impl == "disable":
+            batch_td = batch.to_tensordict()
+            batch_td = left_right_2_no_padding(batch_td)
+            tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
+            output = self.teacher_wg.compute_ref_log_prob(batch_td)
+            log_probs = tu.get(output, "log_probs")
+            log_probs = no_padding_2_padding(log_probs, batch_td)
+            teacher_log_prob = tu.get_tensordict({"teacher_log_prob": log_probs.float()})
+            teacher_log_prob = DataProto.from_tensordict(teacher_log_prob)
+        else:
+            teacher_log_prob = self.teacher_wg.compute_ref_log_prob(batch)
+            teacher_log_prob.batch["teacher_log_prob"] = teacher_log_prob.batch.pop("ref_log_prob")
+        return teacher_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
@@ -1388,6 +1442,11 @@ class RayPPOTrainer:
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                    if self.use_teacher_policy and self.teacher_advantage_enabled:
+                        with marked_timer(str(Role.Teacher), timing_raw, color="teal"):
+                            teacher_log_prob = self._compute_teacher_log_prob(batch)
+                            batch = batch.union(teacher_log_prob)
 
                     # compute values
                     if self.use_critic:

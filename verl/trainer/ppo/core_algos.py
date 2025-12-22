@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    MOPD = "mopd"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -353,6 +354,31 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.MOPD)
+def compute_mopd_advantage(
+    old_log_probs: torch.Tensor,
+    teacher_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute token-level advantages using reverse-KL guidance from a teacher model.
+
+    Args:
+        old_log_probs: Student log probabilities recorded during rollout (behavior policy).
+        teacher_log_prob: Teacher log probabilities evaluated on the same tokens.
+        response_mask: Mask indicating valid response tokens.
+
+    Returns:
+        advantages: Token-wise advantages equal to log p_teacher - log p_student.
+        returns: Identical to advantages since gamma=0 in this formulation.
+    """
+    if teacher_log_prob is None or old_log_probs is None:
+        raise ValueError("Both teacher_log_prob and old_log_probs are required for MOPD advantage")
+    with torch.no_grad():
+        advantages = (teacher_log_prob - old_log_probs) * response_mask
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")

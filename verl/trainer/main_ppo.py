@@ -265,6 +265,33 @@ class TaskRunner:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
+    def add_teacher_worker(self, config):
+        """Add teacher worker when on-policy distillation is enabled."""
+        from verl.trainer.ppo.ray_trainer import Role
+
+        teacher_cfg = getattr(config, "teacher", None)
+        if teacher_cfg is None or not teacher_cfg.enable:
+            return
+
+        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+
+        if use_legacy_worker_impl == "disable":
+            from verl.workers.engine_workers import ActorRolloutRefWorker as TeacherWorker
+        else:
+            teacher_config = getattr(teacher_cfg, "config", None)
+            if teacher_config is None:
+                raise ValueError("teacher.config must be provided when teacher.enable=True")
+            strategy = teacher_config.actor.strategy
+            if strategy in {"fsdp", "fsdp2"}:
+                from verl.workers.fsdp_workers import ActorRolloutRefWorker as TeacherWorker
+            elif strategy == "megatron":
+                from verl.workers.megatron_workers import ActorRolloutRefWorker as TeacherWorker
+            else:
+                raise NotImplementedError(f"Unsupported teacher strategy: {strategy}")
+
+        self.role_worker_mapping[Role.Teacher] = ray.remote(TeacherWorker)
+        self.mapping[Role.Teacher] = "global_pool"
+
     def run(self, config):
         """Execute the main PPO training workflow.
 
@@ -280,6 +307,7 @@ class TaskRunner:
 
         from omegaconf import OmegaConf
 
+        from verl.trainer.ppo.ray_trainer import Role
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
@@ -300,11 +328,15 @@ class TaskRunner:
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
+        # Add teacher worker if enabled.
+        self.add_teacher_worker(config)
+
         # validate config
         validate_config(
             config=config,
             use_reference_policy=need_reference_policy(self.role_worker_mapping),
             use_critic=need_critic(config),
+            use_teacher_policy=Role.Teacher in self.role_worker_mapping,
         )
 
         # Download the checkpoint from HDFS to the local machine.
