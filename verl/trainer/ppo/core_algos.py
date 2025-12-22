@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    MOPD = "mopd"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -415,6 +416,25 @@ def compute_grpo_passk_outcome_advantage(
 
     advantages = advantages.unsqueeze(-1) * response_mask
     return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.MOPD)
+def compute_mopd_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    **_: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute advantages for on-policy distillation.
+
+    The reward-like signal is the per-token reverse KL sample:
+    log_pi_teacher - log_pi_student_old, masked to response tokens.
+    """
+    with torch.no_grad():
+        advantages = (teacher_log_probs - old_log_probs) * response_mask
+    returns = advantages
+    return advantages, returns
 
 
 @register_adv_est(

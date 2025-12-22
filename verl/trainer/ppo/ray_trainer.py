@@ -50,7 +50,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    need_teacher_policy,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -248,14 +255,19 @@ def compute_advantage(
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
         adv_kwargs = {
-            "token_level_rewards": data.batch["token_level_rewards"],
             "response_mask": data.batch["response_mask"],
             "config": config,
         }
+        if "token_level_rewards" in data.batch:
+            adv_kwargs["token_level_rewards"] = data.batch["token_level_rewards"]
         if "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        if "teacher_log_probs" in data.batch:
+            adv_kwargs["teacher_log_probs"] = data.batch["teacher_log_probs"]
+        if "old_log_probs" in data.batch:
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
@@ -328,9 +340,12 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
+        self.use_teacher_policy = need_teacher_policy(self.role_worker_mapping)
         # legacy reward model implementation
         self.use_rm = need_reward_model(self.role_worker_mapping)
         self.use_reward_loop = self.config.reward_model.use_reward_loop
+
+        self.teacher_wg = None
 
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
@@ -744,6 +759,16 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
+        # create teacher policy if needed
+        if self.use_teacher_policy and Role.TeacherPolicy in self.role_worker_mapping:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherPolicy)
+            teacher_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.TeacherPolicy],
+                config=self.config.teacher,
+                role=str(Role.TeacherPolicy),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.TeacherPolicy)] = teacher_policy_cls
+
         # create a reward model if reward_fn is None
         # for legacy discriminative reward model, we create a reward model worker here
         # for reward loop discriminative reward model, we create a reward loop manager here
@@ -831,6 +856,11 @@ class RayPPOTrainer:
                 # Model engine: ActorRolloutRefWorker
                 assert str(Role.ActorRolloutRef) in all_wg, f"{all_wg.keys()=}"
                 self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
+
+        self.teacher_wg = None
+        if self.use_teacher_policy:
+            self.teacher_wg = all_wg[str(Role.TeacherPolicy)]
+            self.teacher_wg.init_model()
 
         self.rm_wg = None
         # initalization of rm_wg will be deprecated in the future
@@ -1003,6 +1033,8 @@ class RayPPOTrainer:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
             if self.use_rm and not self.use_reward_loop:
                 self.rm_wg.start_profile(profile_step=self.global_steps)
+            if self.use_teacher_policy:
+                self.teacher_wg.start_profile(profile_step=self.global_steps)
 
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
@@ -1014,6 +1046,8 @@ class RayPPOTrainer:
                 self.critic_wg.stop_profile()
             if self.use_rm and not self.use_reward_loop:
                 self.rm_wg.stop_profile()
+            if self.use_teacher_policy:
+                self.teacher_wg.stop_profile()
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1089,6 +1123,26 @@ class RayPPOTrainer:
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
         return ref_log_prob
+
+    def _compute_teacher_log_prob(self, batch: DataProto) -> DataProto:
+        if self.use_legacy_worker_impl == "disable":
+            batch_td = batch.to_tensordict()
+            batch_td = left_right_2_no_padding(batch_td)
+            tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
+            if hasattr(self.teacher_wg, "compute_ref_log_prob"):
+                output = self.teacher_wg.compute_ref_log_prob(batch_td)
+            else:
+                output = self.teacher_wg.compute_log_prob(batch_td)
+            log_probs = tu.get(output, "log_probs")
+            log_probs = no_padding_2_padding(log_probs, batch_td)
+            teacher_log_prob = tu.get_tensordict({"teacher_log_probs": log_probs.float()})
+            teacher_log_prob = DataProto.from_tensordict(teacher_log_prob)
+        else:
+            if hasattr(self.teacher_wg, "compute_ref_log_prob"):
+                teacher_log_prob = self.teacher_wg.compute_ref_log_prob(batch)
+            else:
+                teacher_log_prob = self.teacher_wg.compute_log_prob(batch)
+        return teacher_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
@@ -1326,21 +1380,29 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            if not self.use_reward_loop:
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            else:
-                                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                        reward_extra_infos_dict: dict[str, list] = {}
+                        future_reward = None
 
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.MOPD:
+                            reward_tensor = torch.zeros_like(
+                                batch.batch["response_mask"], dtype=torch.float
                             )
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if not self.use_reward_loop:
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                else:
+                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1389,6 +1451,20 @@ class RayPPOTrainer:
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
+                    if self.use_teacher_policy:
+                        with marked_timer(str(Role.TeacherPolicy), timing_raw, color="orange"):
+                            teacher_log_prob = self._compute_teacher_log_prob(batch)
+                            batch = batch.union(teacher_log_prob)
+
+                        teacher_lp = batch.batch["teacher_log_probs"].detach()
+                        old_lp = batch.batch["old_log_probs"].detach()
+                        assert (
+                            teacher_lp.shape == old_lp.shape
+                        ), f"teacher_log_probs shape {teacher_lp.shape} mismatches old_log_probs {old_lp.shape}"
+                        metrics["teacher/reverse_kl"] = masked_mean(
+                            old_lp - teacher_lp, mask=batch.batch["response_mask"], axis=-1
+                        ).mean().item()
+
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
@@ -1398,7 +1474,7 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async and future_reward is not None:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 

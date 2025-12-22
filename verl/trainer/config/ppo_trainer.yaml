@@ -21,6 +21,9 @@ defaults:
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
   - ref@actor_rollout_ref.ref: dp_ref
 
+  # Teacher model config (forward-only, used in on-policy distillation).
+  - ref@teacher: dp_ref
+
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 
@@ -210,6 +213,9 @@ trainer:
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
+
+# Whether to launch a teacher policy for on-policy distillation.
+teacher_enable: False
 
 # profiler configs
 global_profiler:

@@ -75,6 +75,7 @@ def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
     use_critic: bool,
+    use_teacher_policy: bool | None = False,
 ) -> None:
     """Validate an OmegaConf DictConfig.
 
@@ -82,6 +83,7 @@ def validate_config(
         config (DictConfig): The OmegaConf DictConfig to validate.
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
+        use_teacher_policy (bool | None): is teacher policy needed (reserved for on-policy distillation)
     """
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes

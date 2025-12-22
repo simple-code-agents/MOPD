@@ -26,7 +26,7 @@ from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
-from verl.trainer.ppo.utils import need_critic, need_reference_policy
+from verl.trainer.ppo.utils import need_critic, need_reference_policy, need_teacher_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_ascend_device_name, is_cuda_available
 from verl.utils.import_utils import load_extern_object
@@ -265,6 +265,16 @@ class TaskRunner:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
+    def add_teacher_policy_worker(self, config, teacher_policy_cls):
+        """Add teacher policy worker for on-policy distillation."""
+        from verl.trainer.ppo.ray_trainer import Role
+
+        if not getattr(config, "teacher_enable", False):
+            return
+
+        self.role_worker_mapping[Role.TeacherPolicy] = ray.remote(teacher_policy_cls)
+        self.mapping[Role.TeacherPolicy] = "global_pool"
+
     def run(self, config):
         """Execute the main PPO training workflow.
 
@@ -300,10 +310,14 @@ class TaskRunner:
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
+        # Add teacher policy worker if enabled.
+        self.add_teacher_policy_worker(config, actor_rollout_cls)
+
         # validate config
         validate_config(
             config=config,
             use_reference_policy=need_reference_policy(self.role_worker_mapping),
+            use_teacher_policy=need_teacher_policy(self.role_worker_mapping),
             use_critic=need_critic(config),
         )
 
