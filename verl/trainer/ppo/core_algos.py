@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    ON_POLICY_DISTILL = "on_policy_distill"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -353,6 +354,43 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.ON_POLICY_DISTILL)
+def compute_on_policy_distill_advantage(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token-level reverse-KL advantage for on-policy distillation.
+
+    Args:
+        student_log_probs: `(torch.Tensor)`
+            Log-probabilities assigned by the student for sampled tokens.
+        teacher_log_probs: `(torch.Tensor)`
+            Teacher log-probabilities evaluated on the same tokens/prefixes.
+        response_mask: `(torch.Tensor)`
+            Mask restricting updates to response tokens.
+        config: `(AlgoConfig | None)`
+            Algorithm config, optionally containing `whiten_onpolicy_advantage` flag.
+
+    Returns:
+        advantages: `(torch.Tensor)`
+        returns: `(torch.Tensor)`
+    """
+
+    if student_log_probs.shape != teacher_log_probs.shape:
+        raise ValueError(
+            "student_log_probs and teacher_log_probs must share the same shape, "
+            f"got {student_log_probs.shape} vs {teacher_log_probs.shape}"
+        )
+
+    with torch.no_grad():
+        advantages = (teacher_log_probs - student_log_probs) * response_mask
+        if config is not None and config.get("whiten_onpolicy_advantage", False):
+            advantages = verl_F.masked_whiten(advantages, response_mask)
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")

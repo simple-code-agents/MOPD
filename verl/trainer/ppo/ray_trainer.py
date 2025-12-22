@@ -244,6 +244,19 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.ON_POLICY_DISTILL:
+        if "old_log_probs" not in data.batch or "ref_log_prob" not in data.batch:
+            raise ValueError(
+                "On-policy distillation requires both 'old_log_probs' and 'ref_log_prob' in the batch."
+            )
+        advantages, returns = core_algos.compute_on_policy_distill_advantage(
+            student_log_probs=data.batch["old_log_probs"],
+            teacher_log_probs=data.batch["ref_log_prob"],
+            response_mask=data.batch["response_mask"],
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -350,6 +363,14 @@ class RayPPOTrainer:
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+
+        if (
+            self.config.algorithm.adv_estimator == AdvantageEstimator.ON_POLICY_DISTILL
+            and not self.use_reference_policy
+        ):
+            raise ValueError(
+                "On-policy distillation requires a reference policy/teacher worker to compute log-probabilities."
+            )
 
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
@@ -1015,6 +1036,16 @@ class RayPPOTrainer:
             if self.use_rm and not self.use_reward_loop:
                 self.rm_wg.stop_profile()
 
+    def _should_compute_token_rewards(self) -> bool:
+        """Decide whether to invoke external reward computation."""
+        if (
+            self.config.algorithm.adv_estimator == AdvantageEstimator.ON_POLICY_DISTILL
+            and not self.use_rm
+            and self.reward_fn is None
+        ):
+            return False
+        return True
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -1325,22 +1356,31 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    reward_tensor = None
+                    reward_extra_infos_dict: dict[str, list] = {}
+                    future_reward = None
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            if not self.use_reward_loop:
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            else:
-                                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                        if self._should_compute_token_rewards():
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if not self.use_reward_loop:
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                else:
+                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
 
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
+
+                    if future_reward is not None:
+                        reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
