@@ -265,6 +265,18 @@ class TaskRunner:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
+    def add_teacher_worker(self, config, actor_rollout_cls):
+        """Add teacher worker group for on-policy distillation (logprob only)."""
+        from verl.trainer.ppo.ray_trainer import Role
+
+        if not getattr(config, "teacher", {}).get("enable", False):
+            return
+
+        # Reuse actor rollout worker class but mark role separately to avoid ref collision.
+        teacher_cls = actor_rollout_cls
+        self.role_worker_mapping[Role.Teacher] = ray.remote(teacher_cls)
+        self.mapping[Role.Teacher] = "global_pool"
+
     def run(self, config):
         """Execute the main PPO training workflow.
 
@@ -299,6 +311,9 @@ class TaskRunner:
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
+
+        # Add a teacher worker for on-policy distillation (separate from ref).
+        self.add_teacher_worker(config, actor_rollout_cls)
 
         # validate config
         validate_config(

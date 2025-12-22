@@ -21,6 +21,9 @@ defaults:
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
   - ref@actor_rollout_ref.ref: dp_ref
 
+  # Teacher model config for on-policy distillation.
+  - teacher@teacher: teacher
+
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 
@@ -118,6 +121,12 @@ algorithm:
 
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
+
+  # Scale factor for MOPD advantages (teacher_logp - student_logp)
+  mopd_adv_scale: 1.0
+
+  # Whether to whiten/normalize MOPD advantages token-wise
+  mopd_normalize_advantage: True
 
 # config for the trainer
 trainer:

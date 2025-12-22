@@ -1,0 +1,5 @@
+# Whether to enable the teacher worker group for on-policy distillation
+enable: false
+
+# Teacher-specific overrides merged on top of actor_rollout_ref.* to build the teacher worker
+overrides: {}

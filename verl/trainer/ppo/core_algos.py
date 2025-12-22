@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    MOPD = "mopd"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -353,6 +354,50 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.MOPD)
+def compute_mopd_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_log_probs: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-token on-policy distillation advantages.
+
+    Args:
+        token_level_rewards: Unused placeholder for interface compatibility.
+        response_mask: Mask for response tokens (bs, seq_len).
+        teacher_log_probs: Teacher log-prob of sampled tokens (bs, seq_len).
+        student_log_probs: Student (behavior) log-prob of sampled tokens (bs, seq_len).
+        config: AlgoConfig with MOPD hyperparameters.
+
+    Returns:
+        Tuple of (advantages, returns), both masked to response tokens.
+    """
+
+    del token_level_rewards  # kept for signature compatibility
+
+    def _get_cfg_attr(name: str, default):
+        if config is None:
+            return default
+        if isinstance(config, dict):
+            return config.get(name, default)
+        return getattr(config, name, default)
+
+    scale = _get_cfg_attr("mopd_adv_scale", 1.0)
+    normalize = _get_cfg_attr("mopd_normalize_advantage", True)
+
+    with torch.no_grad():
+        advantages = (teacher_log_probs - student_log_probs) * scale
+        advantages = advantages * response_mask
+        if normalize:
+            advantages = verl_F.masked_whiten(advantages, response_mask)
+
+    returns = advantages
+    return advantages, returns
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
